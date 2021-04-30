@@ -11,3 +11,5 @@
   * `full` - Applied to full text
 * `/look` - Toggle anti-look (don't turn when clicking users)
 * `/turn [n|ne|e|se|s|sw|w|nw]` - Turn to face the specified direction
+* `/mood` - Toggle the moodlight
+* `/mood settings` - Open the moodlight settings
