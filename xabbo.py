@@ -1,186 +1,114 @@
+import os
+from os import path
 import sys
-import re
+import inspect
 from datetime import datetime
-from typing import Match
+from typing import Callable, Union
 
 from g_python.gextension import Extension
-from g_python.hmessage import Direction, HMessage
+from g_python.hdirection import Direction
+from g_python.hmessage import HMessage
 from g_python.hpacket import HPacket
 
-# --- Options ---
-class Options:
-    AntiIdle = True
-    AntiTyping = True
-    AntiBobba = True
-    AntiBobbaLocalized = True
-    AntiLook = True
+from options import Options
 
-opts = Options()
+import importlib
 
-# --- Constants ---
-ANTI_BOBBA = "ƳƷ"
-DIRECTIONS = ['n', 'ne', 'e', 'se', 's', 'sw', 'w', 'nw']
-VECTORS = [
-    ( -1000, -10000 ), # N
-    ( 1000, -10000 ),  # NE
-    ( 10000, -1000 ),  # E
-    ( 10000, 1000 ),   # SE
-    ( 1000, 10000 ),   # S
-    ( -1000, 10000 ),  # SW
-    ( -10000, 1000 ),  # W
-    ( -10000, -1000 )  # NW
-]
+VERSION = "1.1.0"
 
-# --- Utility ---
-def log(message: str):
-    print(f'[{datetime.now():%H:%M:%S}] {message}')
+CMD_PREFIX = '/'
 
-def info(message: str):
-    ext.send_to_client(HPacket('Whisper', -1, message, 0, 2, 0, 0))
+class XabboExt(Extension):
+    opts: Options
+    __cmds: dict[str, Callable[[list[str]], None]]
 
-def handle_command(text) -> bool:
-    if text[0] != '/':
-        return False
-    args = text[1:].split()
-    cmd = args[0].lower()
-    args = args[1:]
-    if cmd in cmd_handlers:
-        cmd_handlers[cmd](args)
-    else:
-        info(f'Unknown command: \'{cmd}\'')
-    return True
+    def __init__(self):
+        super().__init__({
+            'title': 'xabbo.py',
+            'description': 'yes',
+            'version': VERSION,
+            'author': 'b7'
+        }, sys.argv)
+        self.on_event('init', lambda: self.log('Extension initialized'))
+        self.on_event('connection_start', lambda: self.log('Connection established'))
+        self.on_event('connection_end', lambda: self.log('Connection lost'))
+        self.intercept_out(self.__on_whisper, 'Whisper')
+        self.intercept_out(self.__on_chat, 'Chat')
+        self.intercept_out(self.__on_chat, 'Shout')
+        self.opts = Options()
+        self.__cmds = dict()
+    
+    def init(self):
+        self.log(f'--- xabbo.py v{VERSION} ---')
+        components_dir = path.join(path.dirname(__file__), 'components')
+        for filename in os.listdir(components_dir):
+            if filename.endswith('.py'):
+                module_name = 'components.' + filename[:-3]
+                module = importlib.import_module(module_name)
+                members = inspect.getmembers(module, inspect.isclass)
+                for className, member in members:
+                    if not className.endswith('Component'): continue
+                    componentName = className[:-len('Component')]
+                    if len(componentName) == 0: continue
+                    export = getattr(module, className)
+                    component = export()
+                    component.ext = self
+                    component.opts = self.opts
+                    component.init()
+                    self.log(f'Loaded {componentName} component');
 
-def inject_anti_bobba(text: str) -> str:
-    if isinstance(text, Match):
-        text = text[1]
-    return ANTI_BOBBA.join(text)
+    def info(self, message: str):
+        self.send_to_client(HPacket('Whisper', -1, message, 0, 2, 0, 0))
+    
+    def log(self, message: str):
+        print(f'[{datetime.now():%H:%M:%S}] {message}')
+    
+    def intercept_out(self,
+                      callback: Callable[[HMessage], None],
+                      id: Union[int, str] = -1,
+                      mode: str = 'default'):
+        self.intercept(Direction.TO_SERVER, callback, id, mode)
+    
+    def intercept_in(self,
+                     callback: Callable[[HMessage], None],
+                     id: Union[int, str] = -1,
+                     mode: str = 'default'):
+        self.intercept(Direction.TO_CLIENT, callback, id, mode)
+    
+    def register_cmd(self,
+                     command: str,
+                     handler: Callable[[list[str]], None],
+                     aliases: Union[str, list[str]] = []):
+        if isinstance(aliases, str):
+            aliases = [aliases]
+        for cmd in [command, *aliases]:
+            cmd = cmd.lower()
+            if cmd in self.__cmds:
+                raise Exception(f'The command \'{cmd}\' is already registered')
+            self.__cmds[cmd] = handler
+    
+    def __on_whisper(self, msg: HMessage):
+        message = msg.packet.read_string()
+        index = message.find(' ')
+        if index < 0: return
+        message = message[index+1:]
+        if message[0] == CMD_PREFIX:
+            msg.is_blocked = True
+            self.handle_command(message)
 
-def apply_anti_bobba(text: str) -> str:
-    if opts.AntiBobbaLocalized:
-        text = re.sub(r'\[([^\[\]]+)\]', inject_anti_bobba, text)
-    else:
-        text = inject_anti_bobba(text)
-    return text
+    def __on_chat(self, msg: HMessage):
+        message = msg.packet.read_string()
+        if message[0] == CMD_PREFIX:
+            msg.is_blocked = True
+            self.handle_command(message)
 
-# --- Commands ---
-def cmd_anti_idle(args):
-    opts.AntiIdle = not opts.AntiIdle
-    status = ('disabled', 'enabled')[opts.AntiIdle]
-    info(f'Anti-idle {status}')
-
-def cmd_anti_typing(args):
-    opts.AntiTyping = not opts.AntiTyping
-    status = ('disabled', 'enabled')[opts.AntiTyping]
-    info(f'Anti-typing {status}')    
-
-def cmd_anti_bobba(args):
-    if len(args) == 0:
-        opts.AntiBobba = not opts.AntiBobba
-    else:
-        mode = args[0].lower()
-        if mode == 'off':
-            opts.AntiBobba = False
-            info('Anti-bobba disabled')
-        elif mode == 'local':
-            opts.AntiBobba = True
-            opts.AntiBobbaLocalized = True
-        elif mode == 'full':
-            opts.AntiBobba = True
-            opts.AntiBobbaLocalized = False
-        else:
+    def handle_command(self, message: str):
+        if message[0] != '/':
             return
-    if opts.AntiBobba:
-        if opts.AntiBobbaLocalized:
-            info('Localized anti-bobba enabled')
+        args = message.strip().split()
+        command = args[0][1:].lower()
+        args = args[1:]
+        if command in self.__cmds:
+            self.__cmds[command](args)
         else:
-            info('Full anti-bobba enabled')
-    else:
-        info('Anti-bobba disabled')
-
-def cmd_anti_look(args):
-    opts.AntiLook = not opts.AntiLook
-    status = ('disabled', 'enabled')[opts.AntiLook]
-    info(f'Anti-look {status}')
-
-def cmd_turn(args):
-    if len(args) == 0:
-        return
-    dir = args[0].lower()
-    if dir in DIRECTIONS:
-        index = DIRECTIONS.index(dir)
-        vector = VECTORS[index]
-        ext.send_to_server(HPacket('LookTo', vector[0], vector[1]))
-
-cmd_handlers = {
-    'idle': cmd_anti_idle,
-    'type': cmd_anti_typing,
-    'bobba': cmd_anti_bobba,
-    'look': cmd_anti_look,
-    'turn': cmd_turn
-}
-
-# --- Intercepts ---
-def on_ping(msg: HMessage):
-    if opts.AntiIdle:
-        ext.send_to_server(HPacket('AvatarExpression', 0))
-        log('Anti-idle')
-
-def on_whisper(msg: HMessage):
-    text = msg.packet.read_string()
-    if ' ' not in text:
-        return
-    index = text.index(' ')
-    target = text[:index]
-    text = text[index+1:]
-    log(f'whisper({target}, {text})')
-    if handle_command(text):
-        msg.is_blocked = True
-    elif opts.AntiBobba:
-        text = apply_anti_bobba(text)
-        msg.packet.replace_string(6, f'{target} {text}')
-
-def on_chat(msg: HMessage):
-    text = msg.packet.read_string()
-    if handle_command(text):
-        msg.is_blocked = True
-    elif opts.AntiBobba:
-        text = apply_anti_bobba(text)
-        msg.packet.replace_string(6, text)
-
-def on_look_to(msg: HMessage):
-    if opts.AntiLook:
-        msg.is_blocked = True
-
-def on_start_typing(msg: HMessage):
-    if opts.AntiTyping:
-        msg.is_blocked = True
-
-# --- Extension ---
-ext = Extension({
-    'title': 'xabbo.py',
-    'description': 'yes',
-    'version': '1.0.1',
-    'author': 'b7'
-}, sys.argv)
-
-def on_initialized():
-    log('Extension initialized')
-
-def on_connection_start():
-    log('Connection established')
-
-def on_connection_end():
-    log('Connection lost')
-
-ext.on_event('init', on_initialized)
-ext.on_event('connection_start', on_connection_start)
-ext.on_event('connection_end', on_connection_end)
-
-ext.intercept(Direction.TO_CLIENT, on_ping, 'Ping')
-ext.intercept(Direction.TO_SERVER, on_whisper, 'Whisper')
-ext.intercept(Direction.TO_SERVER, on_chat, 'Chat')
-ext.intercept(Direction.TO_SERVER, on_chat, 'Shout')
-ext.intercept(Direction.TO_SERVER, on_look_to, 'LookTo')
-ext.intercept(Direction.TO_SERVER, on_start_typing, 'StartTyping')
-
-ext.start()
+            self.info(f'Unknown command: \'{command}\'')
